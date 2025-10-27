@@ -116,7 +116,7 @@ const FAQ = () => {
       <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8">
         {/* Section Header */}
         <div className="text-center mb-16">
-          <h2 className="text-3xl lg:text-4xl font-bold text-white mb-6">
+          <h2 className="text-3xl lg:text-2xl font-bold text-white mb-6">
             Frequently Asked Questions
           </h2>
           <p className="text-xl text-gray-400">

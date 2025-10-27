@@ -43,7 +43,7 @@ const HowItWorks = () => {
           <h2 className="text-3xl lg:text-4xl font-bold text-white mb-6">
             How Does It Work?
           </h2>
-          <p className="text-xl text-gray-400 max-w-2xl mx-auto">
+          <p className="text-xl text-white-400 max-w-2xl mx-auto">
             Simple steps to transform your business idea into reality
           </p>
         </div>

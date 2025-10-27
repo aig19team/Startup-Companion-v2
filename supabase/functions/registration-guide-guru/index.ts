@@ -1,4 +1,5 @@
 import { createClient } from 'npm:@supabase/supabase-js@2';
+import { generateAndStorePDF } from './_shared/pdfGenerator.ts';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -87,18 +88,16 @@ Deno.serve(async (req: Request) => {
 
     const { message, sessionId, userId, businessProfile }: RequestPayload = await req.json();
 
-    // Get business profile from database if not provided
     let profile = businessProfile;
     if (!profile) {
       const { data: profileData } = await supabaseClient
         .from('business_profiles')
         .select('*')
-        .eq('user_id', userId)
+        .eq('session_id', sessionId)
         .maybeSingle();
       profile = profileData || {};
     }
 
-    // Build context for AI
     const contextInfo = `
 Business Information:
 - Company Name: ${profile.business_name || 'To be determined'}
@@ -109,32 +108,80 @@ Business Information:
 
 Generate a comprehensive registration guide for this business.`;
 
-    // Call AI to generate the guide
     const fullContent = await callOpenRouterAPI(contextInfo);
-
-    // Extract key points from the generated content
     const keyPoints = extractKeyPoints(fullContent);
 
-    // Store in generated_documents table
-    const { data: docData } = await supabaseClient
+    const pdfResult = await generateAndStorePDF(
+      {
+        userId,
+        documentType: 'registration',
+        content: fullContent,
+        businessName: profile.business_name || 'Your Business'
+      },
+      supabaseClient
+    );
+
+    // Use upsert to handle re-generation scenarios
+    // Check if document already exists for this session and type
+    const { data: existingDoc } = await supabaseClient
       .from('generated_documents')
-      .insert({
-        user_id: userId,
-        session_id: sessionId,
-        document_type: 'registration',
-        document_title: 'Registration Guide',
-        key_points: keyPoints,
-        full_content: fullContent,
-        generation_status: 'completed'
-      })
-      .select()
-      .single();
+      .select('id')
+      .eq('session_id', sessionId)
+      .eq('document_type', 'registration')
+      .maybeSingle();
+
+    let docData, docError;
+
+    if (existingDoc) {
+      // Update existing document
+      const result = await supabaseClient
+        .from('generated_documents')
+        .update({
+          document_title: 'Registration Guide',
+          key_points: JSON.stringify(keyPoints),
+          full_content: fullContent,
+          pdf_url: pdfResult?.pdfUrl || null,
+          pdf_file_name: pdfResult?.fileName || null,
+          generation_status: 'completed',
+          service_type: 'confirmed_idea_flow'
+        })
+        .eq('id', existingDoc.id)
+        .select()
+        .single();
+      docData = result.data;
+      docError = result.error;
+    } else {
+      // Insert new document
+      const result = await supabaseClient
+        .from('generated_documents')
+        .insert({
+          user_id: userId,
+          session_id: sessionId,
+          document_type: 'registration',
+          document_title: 'Registration Guide',
+          key_points: JSON.stringify(keyPoints),
+          full_content: fullContent,
+          pdf_url: pdfResult?.pdfUrl || null,
+          pdf_file_name: pdfResult?.fileName || null,
+          generation_status: 'completed',
+          service_type: 'confirmed_idea_flow'
+        })
+        .select()
+        .single();
+      docData = result.data;
+      docError = result.error;
+    }
+
+    if (docError) {
+      console.error('Error storing document in database:', docError);
+    }
 
     return new Response(
       JSON.stringify({
         response: fullContent,
         keyPoints: keyPoints,
         fullContent: fullContent,
+        pdfUrl: pdfResult?.pdfUrl,
         documentId: docData?.id
       }),
       {
@@ -227,31 +274,102 @@ async function callOpenRouterAPI(contextInfo: string): Promise<string> {
 
 function extractKeyPoints(content: string): string[] {
   const keyPoints: string[] = [];
-  
-  // Extract entity type recommendation
-  const entityMatch = content.match(/\*\*Recommended Entity Type\*\*[:\s]*([^\n]+)/i);
-  if (entityMatch) {
-    keyPoints.push(`Recommended: ${entityMatch[1].trim().substring(0, 100)}`);
+
+  if (!content || content.length < 100) {
+    return [
+      'Complete registration guide with timeline',
+      'Recommended entity type and structure',
+      'Required documents checklist',
+      'Government portal links and resources',
+      'Cost breakdown and fee structure',
+      'Post-registration compliance requirements'
+    ];
   }
-  
-  // Extract timeline
-  if (content.includes('Day 1') || content.includes('Timeline')) {
-    keyPoints.push('Complete registration process: 25-30 days');
+
+  const entityPatterns = [
+    /(?:recommended|suggest|best)\s+entity\s+type[:\s-]*([^\n.]+)/i,
+    /entity\s+type[:\s-]*([^\n.]+?)(?:based|for|with)/i,
+    /(proprietorship|partnership|llp|private limited|public limited)/i
+  ];
+
+  for (const pattern of entityPatterns) {
+    const match = content.match(pattern);
+    if (match && match[1]) {
+      const entityText = match[1].trim().replace(/\*/g, '').substring(0, 80);
+      if (entityText.length > 5) {
+        keyPoints.push(`Recommended: ${entityText}`);
+        break;
+      }
+    }
   }
-  
-  // Extract cost info
-  const costMatch = content.match(/Total[:\s]*₹?([\d,]+)/i);
-  if (costMatch) {
-    keyPoints.push(`Estimated cost: ₹${costMatch[1]}`);
-  } else {
-    keyPoints.push('Estimated cost: ₹15,000 - ₹25,000');
+
+  const timelinePatterns = [
+    /(\d+[-–]\d+)\s*days?/i,
+    /timeline[:\s]*(\d+)\s*(?:to|-)\s*(\d+)\s*days?/i,
+    /(?:takes?|requires?)\s*(\d+)\s*days?/i
+  ];
+
+  for (const pattern of timelinePatterns) {
+    const match = content.match(pattern);
+    if (match) {
+      const days = match[1] || `${match[1]}-${match[2]}` || '25-30';
+      keyPoints.push(`Registration timeline: ${days} days`);
+      break;
+    }
   }
-  
-  // Standard key points
-  keyPoints.push('Step-by-step registration timeline included');
-  keyPoints.push('Complete documents checklist provided');
-  keyPoints.push('Official government portal links included');
-  keyPoints.push('Post-registration compliance guide included');
-  
+
+  if (keyPoints.length < 2 && (content.toLowerCase().includes('day 1') || content.toLowerCase().includes('timeline'))) {
+    keyPoints.push('Complete step-by-step registration timeline');
+  }
+
+  const costPatterns = [
+    /(?:total|estimated|approximate)\s*cost[:\s]*₹?([\d,]+)/i,
+    /₹\s*([\d,]+)\s*(?:to|-)\s*₹?\s*([\d,]+)/i,
+    /cost[:\s]*₹?([\d,]+)/i
+  ];
+
+  for (const pattern of costPatterns) {
+    const match = content.match(pattern);
+    if (match && match[1]) {
+      const cost = match[2] ? `₹${match[1]}-${match[2]}` : `₹${match[1]}`;
+      keyPoints.push(`Estimated cost: ${cost}`);
+      break;
+    }
+  }
+
+  if (keyPoints.length < 3) {
+    keyPoints.push('Detailed cost breakdown included');
+  }
+
+  if (content.toLowerCase().includes('document') && content.toLowerCase().includes('checklist')) {
+    keyPoints.push('Required documents checklist provided');
+  } else if (content.toLowerCase().includes('pan') || content.toLowerCase().includes('aadhaar')) {
+    keyPoints.push('Complete documentation requirements');
+  }
+
+  if (content.includes('mca.gov.in') || content.toLowerCase().includes('government portal')) {
+    keyPoints.push('Official government portal links included');
+  }
+
+  if (content.toLowerCase().includes('compliance') || content.toLowerCase().includes('post-registration')) {
+    keyPoints.push('Post-registration compliance guide');
+  }
+
+  const fallbackPoints = [
+    'Step-by-step registration process',
+    'Entity type recommendations',
+    'Complete documentation guide',
+    'Timeline and milestones',
+    'Cost estimates and fees',
+    'Compliance requirements'
+  ];
+
+  for (const fallback of fallbackPoints) {
+    if (keyPoints.length >= 6) break;
+    if (!keyPoints.some(point => point.toLowerCase().includes(fallback.toLowerCase().split(' ')[0]))) {
+      keyPoints.push(fallback);
+    }
+  }
+
   return keyPoints.slice(0, 6);
 }

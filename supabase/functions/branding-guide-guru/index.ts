@@ -1,4 +1,5 @@
 import { createClient } from 'npm:@supabase/supabase-js@2';
+import { generateAndStorePDF } from './_shared/pdfGenerator.ts';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -17,57 +18,63 @@ const BRANDING_GUIDE_PROMPT = `You are an expert brand strategist and visual ide
 
 The guide MUST include:
 
-1. **Brand Identity Overview**
+1. **Brand Name Suggestions**
+   - 5-7 creative brand name options
+   - Brief rationale for each name
+   - Domain availability considerations
+   - Trademark potential assessment
+
+2. **Brand Identity Overview**
    - Brand positioning statement
    - Target audience profile
    - Brand personality and tone
    - Core brand values
 
-2. **Logo Design Concept** (based on the style preference provided)
+3. **Logo Design Concept** (based on the style preference provided)
    - Primary logo concept description
    - Logo variations (horizontal, vertical, icon-only)
    - Usage guidelines and minimum sizes
    - Clear space requirements
 
-3. **Color Palette** (aligned with color preference provided)
+4. **Color Palette** (aligned with color preference provided)
    - Primary colors (3-4 colors with HEX, RGB, and CMYK values)
    - Secondary colors (2-3 supporting colors)
    - Color psychology and rationale
    - Color usage guidelines
 
-4. **Typography System**
+5. **Typography System**
    - Primary typeface for headings (with alternatives)
    - Secondary typeface for body text
    - Font weights and sizes
    - Typography hierarchy
 
-5. **Brand Applications**
+6. **Brand Applications**
    - Business card design concept
    - Letterhead design concept
    - Email signature format
    - Social media profile guidelines
    - Website design direction
 
-6. **Visual Style Guidelines**
+7. **Visual Style Guidelines**
    - Photography style
    - Iconography style
    - Graphic elements and patterns
    - Do's and Don'ts
 
-7. **Brand Voice and Messaging**
+8. **Brand Voice and Messaging**
    - Tone of voice guidelines
    - Key messaging pillars
    - Tagline suggestions (3-4 options)
    - Sample copy examples
 
-8. **Intellectual Property Protection**
+9. **Intellectual Property Protection**
    - Trademark registration process
    - Trademark classes to consider
    - Copyright registration for creative assets
    - Domain name registration recommendations
    - IP protection timeline and costs
 
-9. **Implementation Roadmap**
+10. **Implementation Roadmap**
    - Phase 1: Logo and basic identity (Week 1-2)
    - Phase 2: Marketing collateral (Week 3-4)
    - Phase 3: Digital presence (Week 5-6)
@@ -96,7 +103,7 @@ Deno.serve(async (req: Request) => {
       const { data: profileData } = await supabaseClient
         .from('business_profiles')
         .select('*')
-        .eq('user_id', userId)
+        .eq('session_id', sessionId)
         .maybeSingle();
       profile = profileData || {};
     }
@@ -115,25 +122,78 @@ Generate a comprehensive branding guide for this business that aligns with their
     const fullContent = await callOpenRouterAPI(contextInfo);
     const keyPoints = extractKeyPoints(fullContent, profile);
 
-    const { data: docData } = await supabaseClient
+    // Generate and store PDF
+    const pdfResult = await generateAndStorePDF(
+      {
+        userId,
+        documentType: 'branding',
+        content: fullContent,
+        businessName: profile.business_name || 'Your Business'
+      },
+      supabaseClient
+    );
+
+    // Use upsert to handle re-generation scenarios
+    // Check if document already exists for this session and type
+    const { data: existingDoc } = await supabaseClient
       .from('generated_documents')
-      .insert({
-        user_id: userId,
-        session_id: sessionId,
-        document_type: 'branding',
-        document_title: 'Branding Guide',
-        key_points: keyPoints,
-        full_content: fullContent,
-        generation_status: 'completed'
-      })
-      .select()
-      .single();
+      .select('id')
+      .eq('session_id', sessionId)
+      .eq('document_type', 'branding')
+      .maybeSingle();
+
+    let docData, docError;
+
+    if (existingDoc) {
+      // Update existing document
+      const result = await supabaseClient
+        .from('generated_documents')
+        .update({
+          document_title: 'Branding Guide',
+          key_points: JSON.stringify(keyPoints),
+          full_content: fullContent,
+          pdf_url: pdfResult?.pdfUrl || null,
+          pdf_file_name: pdfResult?.fileName || null,
+          generation_status: 'completed',
+          service_type: 'confirmed_idea_flow'
+        })
+        .eq('id', existingDoc.id)
+        .select()
+        .single();
+      docData = result.data;
+      docError = result.error;
+    } else {
+      // Insert new document
+      const result = await supabaseClient
+        .from('generated_documents')
+        .insert({
+          user_id: userId,
+          session_id: sessionId,
+          document_type: 'branding',
+          document_title: 'Branding Guide',
+          key_points: JSON.stringify(keyPoints),
+          full_content: fullContent,
+          pdf_url: pdfResult?.pdfUrl || null,
+          pdf_file_name: pdfResult?.fileName || null,
+          generation_status: 'completed',
+          service_type: 'confirmed_idea_flow'
+        })
+        .select()
+        .single();
+      docData = result.data;
+      docError = result.error;
+    }
+
+    if (docError) {
+      console.error('Error storing document in database:', docError);
+    }
 
     return new Response(
       JSON.stringify({
         response: fullContent,
         keyPoints: keyPoints,
         fullContent: fullContent,
+        pdfUrl: pdfResult?.pdfUrl,
         documentId: docData?.id
       }),
       {
@@ -226,15 +286,97 @@ async function callOpenRouterAPI(contextInfo: string): Promise<string> {
 
 function extractKeyPoints(content: string, profile: any): string[] {
   const keyPoints: string[] = [];
-  
-  keyPoints.push(`Brand style: ${profile.style_preference || 'Modern/Contemporary'}`);
-  keyPoints.push(`Color scheme: ${profile.color_preference || 'Professional'} tones`);
-  keyPoints.push('Complete logo design concept and variations');
-  keyPoints.push('Professional color palette with HEX, RGB, CMYK values');
-  keyPoints.push('Typography system and font recommendations');
-  keyPoints.push('Business card, letterhead, and collateral designs');
-  keyPoints.push('Brand voice and messaging guidelines');
-  keyPoints.push('IP protection and trademark registration guide');
-  
+
+  if (!content || content.length < 100) {
+    return [
+      `Brand style: ${profile.style_preference || 'Modern/Contemporary'}`,
+      `Color scheme: ${profile.color_preference || 'Professional'} tones`,
+      'Complete logo design concepts',
+      'Professional color palette guide',
+      'Typography and font recommendations',
+      'Brand collateral designs'
+    ];
+  }
+
+  // Add style and color preferences from profile
+  if (profile.style_preference) {
+    keyPoints.push(`Brand style: ${profile.style_preference}`);
+  }
+
+  if (profile.color_preference) {
+    keyPoints.push(`Color scheme: ${profile.color_preference} tones`);
+  }
+
+  // Extract color palette information
+  const colorPatterns = [
+    /#[0-9a-f]{6}/gi,
+    /rgb\s*\(/gi,
+    /primary color/gi,
+    /color palette/gi
+  ];
+
+  if (colorPatterns.some(pattern => content.match(pattern))) {
+    keyPoints.push('Professional color palette with HEX/RGB values');
+  } else if (content.toLowerCase().includes('color')) {
+    keyPoints.push('Comprehensive color scheme guide');
+  }
+
+  // Check for logo design
+  if (content.toLowerCase().includes('logo') || content.toLowerCase().includes('brand mark')) {
+    if (content.toLowerCase().includes('variation') || content.toLowerCase().includes('horizontal') ||
+        content.toLowerCase().includes('vertical')) {
+      keyPoints.push('Complete logo design with variations');
+    } else {
+      keyPoints.push('Logo design concept included');
+    }
+  }
+
+  // Check for typography
+  const typographyKeywords = ['typography', 'typeface', 'font', 'heading', 'body text'];
+  if (typographyKeywords.some(keyword => content.toLowerCase().includes(keyword))) {
+    keyPoints.push('Typography system and font recommendations');
+  }
+
+  // Check for brand applications
+  const applicationKeywords = ['business card', 'letterhead', 'email signature', 'collateral', 'stationery'];
+  if (applicationKeywords.some(keyword => content.toLowerCase().includes(keyword))) {
+    keyPoints.push('Brand collateral designs (cards, letterhead)');
+  }
+
+  // Check for brand voice
+  if (content.toLowerCase().includes('brand voice') || content.toLowerCase().includes('messaging') ||
+      content.toLowerCase().includes('tone of voice') || content.toLowerCase().includes('tagline')) {
+    keyPoints.push('Brand voice and messaging guidelines');
+  }
+
+  // Check for IP protection
+  if (content.toLowerCase().includes('trademark') || content.toLowerCase().includes('intellectual property') ||
+      content.toLowerCase().includes('ip protection') || content.toLowerCase().includes('copyright')) {
+    keyPoints.push('IP protection and trademark registration guide');
+  }
+
+  // Check for visual guidelines
+  if (content.toLowerCase().includes('visual') || content.toLowerCase().includes('photography') ||
+      content.toLowerCase().includes('iconography')) {
+    keyPoints.push('Visual style and design guidelines');
+  }
+
+  // Add fallback points if needed
+  const fallbackPoints = [
+    'Brand identity overview',
+    'Logo design concepts',
+    'Color system guidelines',
+    'Typography specifications',
+    'Marketing collateral designs',
+    'Implementation roadmap'
+  ];
+
+  for (const fallback of fallbackPoints) {
+    if (keyPoints.length >= 6) break;
+    if (!keyPoints.some(point => point.toLowerCase().includes(fallback.toLowerCase().split(' ')[0]))) {
+      keyPoints.push(fallback);
+    }
+  }
+
   return keyPoints.slice(0, 6);
 }

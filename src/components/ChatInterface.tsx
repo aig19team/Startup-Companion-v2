@@ -1,9 +1,10 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Send, User, Bot, History, X, Star, Phone, Mail, Lightbulb, FileCheck } from 'lucide-react';
+import { Send, User, Bot, Star, Phone, Mail, FileCheck } from 'lucide-react';
 import { auth } from '../lib/auth';
 import { submitRating, getMentorForService } from '../lib/rating';
-import { createSession, getUserSessions, getSessionMessages, getServiceDisplayName, type UserSession } from '../lib/session';
+import { createSession, saveChatMessage, updateSessionStatus } from '../lib/session';
 import { supabase } from '../lib/supabase';
+import { getDocumentsBySession, type GeneratedDocument } from '../lib/documentService';
 import DocumentDashboard from './DocumentDashboard';
 import DocumentViewer from './DocumentViewer';
 
@@ -37,17 +38,6 @@ interface Document {
   status: 'generating' | 'completed' | 'failed';
 }
 
-interface SessionHistory {
-  id: string;
-  service: string;
-  task: string;
-  timestamp: Date;
-  messages: Message[];
-  icon: React.ComponentType<any>;
-  status: 'completed' | 'in-progress' | 'escalated' | 'active' | 'abandoned';
-  rating?: number;
-}
-
 interface ChatInterfaceProps {
   onNavigate?: (page: string) => void;
 }
@@ -67,11 +57,7 @@ const QUESTIONS = [
 const ChatInterface = ({ onNavigate }: ChatInterfaceProps) => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputText, setInputText] = useState('');
-  const [showHistory, setShowHistory] = useState(false);
-  const [sessionHistory, setSessionHistory] = useState<SessionHistory[]>([]);
   const [currentUser, setCurrentUser] = useState<any>(null);
-  const [selectedSession, setSelectedSession] = useState<SessionHistory | null>(null);
-  const [sessionMessages, setSessionMessages] = useState<Message[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState<string>('');
 
   // New state for sequential flow
@@ -94,11 +80,12 @@ const ChatInterface = ({ onNavigate }: ChatInterfaceProps) => {
     initializeChat();
   }, []);
 
+
   useEffect(() => {
-    if (currentUser) {
-      loadSessionHistory();
+    if (currentSessionId && (viewMode === 'dashboard' || viewMode === 'document')) {
+      loadDocumentsFromDatabase();
     }
-  }, [currentUser]);
+  }, [currentSessionId, viewMode]);
 
   const initializeChat = async () => {
     try {
@@ -128,26 +115,23 @@ const ChatInterface = ({ onNavigate }: ChatInterfaceProps) => {
     }
   };
 
-  const loadSessionHistory = async () => {
-    if (!currentUser) return;
-
-    const sessions = await getUserSessions(currentUser.id);
-    const historyData: SessionHistory[] = sessions.map(session => ({
-      id: session.id,
-      service: getServiceDisplayName(session.service_type),
-      task: session.service_type,
-      timestamp: new Date(session.created_at),
-      messages: [],
-      icon: FileCheck,
-      status: session.status,
-      rating: session.rating
-    }));
-
-    setSessionHistory(historyData);
-  };
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  const addMessageAndSave = async (message: Message) => {
+    setMessages(prev => [...prev, message]);
+
+    // Save to database if we have a session
+    if (currentSessionId && currentUser) {
+      await saveChatMessage(
+        currentSessionId,
+        currentUser.id,
+        message.type,
+        message.content
+      );
+    }
   };
 
   const handleSendMessage = async () => {
@@ -160,7 +144,7 @@ const ChatInterface = ({ onNavigate }: ChatInterfaceProps) => {
       timestamp: new Date()
     };
 
-    setMessages(prev => [...prev, userMessage]);
+    await addMessageAndSave(userMessage);
     const userInput = inputText;
     setInputText('');
 
@@ -185,12 +169,16 @@ const ChatInterface = ({ onNavigate }: ChatInterfaceProps) => {
         content: 'Idea Tuning service will be available soon! This feature will help you refine and validate your business concept.\n\nFor now, if you have a confirmed idea, please type "2" to proceed with document generation.',
         timestamp: new Date()
       };
-      setMessages(prev => [...prev, aiMessage]);
+      await addMessageAndSave(aiMessage);
     } else if (choice === '2') {
       // Confirmed Idea - start questioning flow
+      // Always create a NEW session for each flow
       const session = await createSession(currentUser?.id, 'confirmed_idea_flow');
       if (session) {
         setCurrentSessionId(session);
+        // Reset business profile state for new session
+        setBusinessProfile({});
+        setCurrentQuestionIndex(0);
       }
 
       setFlowStage('questioning');
@@ -200,7 +188,7 @@ const ChatInterface = ({ onNavigate }: ChatInterfaceProps) => {
         content: `Great! I'll ask you 6 quick questions to gather the information we need.\n\nQuestion 1 of 6:\n${QUESTIONS[0].prompt}`,
         timestamp: new Date()
       };
-      setMessages(prev => [...prev, aiMessage]);
+      await addMessageAndSave(aiMessage);
     } else {
       const aiMessage: Message = {
         id: Date.now().toString(),
@@ -208,7 +196,7 @@ const ChatInterface = ({ onNavigate }: ChatInterfaceProps) => {
         content: 'Please type 1 for Idea Tuning or 2 for Confirmed Idea to proceed.',
         timestamp: new Date()
       };
-      setMessages(prev => [...prev, aiMessage]);
+      await addMessageAndSave(aiMessage);
     }
   };
 
@@ -241,7 +229,7 @@ const ChatInterface = ({ onNavigate }: ChatInterfaceProps) => {
         content: `Got it!\n\nQuestion ${nextIndex + 1} of 6:\n${QUESTIONS[nextIndex].prompt}`,
         timestamp: new Date()
       };
-      setMessages(prev => [...prev, aiMessage]);
+      await addMessageAndSave(aiMessage);
     } else {
       // All questions answered - start generation
       setFlowStage('generating');
@@ -251,7 +239,7 @@ const ChatInterface = ({ onNavigate }: ChatInterfaceProps) => {
         content: 'Perfect! I have all the information I need.\n\nProcessing your information and generating your business documents...\n\nThis may take a few moments. Please wait.',
         timestamp: new Date()
       };
-      setMessages(prev => [...prev, aiMessage]);
+      await addMessageAndSave(aiMessage);
 
       // Trigger document generation
       await generateAllDocuments();
@@ -259,33 +247,66 @@ const ChatInterface = ({ onNavigate }: ChatInterfaceProps) => {
   };
 
   const updateBusinessProfile = async (profile: any) => {
-    if (!currentUser) return;
+    if (!currentUser || !currentSessionId) return;
 
     try {
-      // Check if profile exists
+      // Check if profile exists for this session
       const { data: existingProfile } = await supabase
         .from('business_profiles')
-        .select('id')
-        .eq('user_id', currentUser.id)
+        .select('*')
+        .eq('session_id', currentSessionId)
         .maybeSingle();
 
       if (existingProfile) {
-        // Update existing profile
+        // Merge new data with existing profile (partial update)
+        const mergedProfile: any = { ...existingProfile };
+
+        // Only update fields that have new values
+        Object.keys(profile).forEach(key => {
+          if (profile[key] !== undefined && profile[key] !== null && profile[key] !== '') {
+            mergedProfile[key] = profile[key];
+          }
+        });
+
+        // Update existing profile for this session
         await supabase
           .from('business_profiles')
-          .update(profile)
-          .eq('user_id', currentUser.id);
+          .update(mergedProfile)
+          .eq('session_id', currentSessionId);
       } else {
-        // Create new profile
+        // Create new profile for this session
         await supabase
           .from('business_profiles')
           .insert({
             user_id: currentUser.id,
+            session_id: currentSessionId,
             ...profile
           });
       }
     } catch (error) {
       console.error('Error updating business profile:', error);
+    }
+  };
+
+  const loadDocumentsFromDatabase = async () => {
+    if (!currentSessionId) return;
+
+    try {
+      const dbDocuments = await getDocumentsBySession(currentSessionId);
+
+      const formattedDocs: Document[] = dbDocuments.map(doc => ({
+        id: doc.id,
+        type: doc.document_type,
+        title: doc.document_title,
+        keyPoints: Array.isArray(doc.key_points) ? doc.key_points : [],
+        fullContent: doc.full_content || '',
+        pdfUrl: doc.pdf_url || undefined,
+        status: doc.generation_status
+      }));
+
+      setDocuments(formattedDocs);
+    } catch (error) {
+      console.error('Error loading documents from database:', error);
     }
   };
 
@@ -308,8 +329,11 @@ const ChatInterface = ({ onNavigate }: ChatInterfaceProps) => {
     const promises = documentTypes.map(type => generateDocument(type));
     await Promise.allSettled(promises);
 
+    // Load documents from database after generation
+    await loadDocumentsFromDatabase();
+
     // Show completion message and ask for rating
-    setTimeout(() => {
+    setTimeout(async () => {
       setFlowStage('rating');
       setViewMode('chat');
 
@@ -319,7 +343,7 @@ const ChatInterface = ({ onNavigate }: ChatInterfaceProps) => {
         content: '🎉 All your business documents have been generated!\n\nYou can view them in the document dashboard.\n\nHow would you rate your experience?\n\nPlease type a number from 1-5:\n\n1 ⭐ - Poor\n2 ⭐⭐ - Fair\n3 ⭐⭐⭐ - Good\n4 ⭐⭐⭐⭐ - Very Good\n5 ⭐⭐⭐⭐⭐ - Excellent',
         timestamp: new Date()
       };
-      setMessages(prev => [...prev, ratingMessage]);
+      await addMessageAndSave(ratingMessage);
       setAwaitingRating(true);
     }, 3000);
   };
@@ -417,28 +441,33 @@ const ChatInterface = ({ onNavigate }: ChatInterfaceProps) => {
         content: `Thank you for your ${rating}-star rating! ${rating >= 4 ? '🎉 We\'re glad you had a great experience!' : ''}`,
         timestamp: new Date()
       };
-      setMessages(prev => [...prev, thankYouMessage]);
+      await addMessageAndSave(thankYouMessage);
 
       if (rating <= 3) {
-        setTimeout(() => {
+        setTimeout(async () => {
           const feedbackMessage: Message = {
             id: (Date.now() + 1).toString(),
             type: 'ai',
             content: 'We\'re sorry to hear that. Could you briefly tell us what went wrong or what we could improve? Your feedback helps us serve you better.',
             timestamp: new Date()
           };
-          setMessages(prev => [...prev, feedbackMessage]);
+          await addMessageAndSave(feedbackMessage);
           setRatingFeedback('awaiting');
         }, 1000);
       } else {
-        setTimeout(() => {
+        setTimeout(async () => {
           const finalMessage: Message = {
             id: (Date.now() + 1).toString(),
             type: 'ai',
-            content: 'All your documents are available in the dashboard. You can view or download them anytime. Thank you for using StartUP Companion!',
+            content: 'All your documents are available in the document tab. You can view or download them anytime. Thank you for using StartUP Companion!',
             timestamp: new Date()
           };
-          setMessages(prev => [...prev, finalMessage]);
+          await addMessageAndSave(finalMessage);
+
+          // Update session status to completed
+          if (currentSessionId) {
+            await updateSessionStatus(currentSessionId, 'completed');
+          }
         }, 1500);
       }
     } else if (ratingFeedback === 'awaiting') {
@@ -451,7 +480,7 @@ const ChatInterface = ({ onNavigate }: ChatInterfaceProps) => {
         content: 'Thank you for your feedback. Let us connect you with our expert mentors who can provide personalized guidance for each area of your business.',
         timestamp: new Date()
       };
-      setMessages(prev => [...prev, feedbackThankYou]);
+      await addMessageAndSave(feedbackThankYou);
 
       // Get mentors for each service type
       const serviceTypes = ['registration', 'branding', 'compliance', 'hr'];
@@ -469,7 +498,7 @@ const ChatInterface = ({ onNavigate }: ChatInterfaceProps) => {
         }));
 
       if (mentorCards.length > 0) {
-        setTimeout(() => {
+        setTimeout(async () => {
           const mentorMessage: Message = {
             id: (Date.now() + 1).toString(),
             type: 'ai',
@@ -477,7 +506,12 @@ const ChatInterface = ({ onNavigate }: ChatInterfaceProps) => {
             timestamp: new Date(),
             mentorCards: mentorCards
           };
-          setMessages(prev => [...prev, mentorMessage]);
+          await addMessageAndSave(mentorMessage);
+
+          // Update session status to completed
+          if (currentSessionId) {
+            await updateSessionStatus(currentSessionId, 'completed');
+          }
         }, 1500);
       }
     } else {
@@ -487,7 +521,7 @@ const ChatInterface = ({ onNavigate }: ChatInterfaceProps) => {
         content: 'Please provide a valid rating between 1 and 5.',
         timestamp: new Date()
       };
-      setMessages(prev => [...prev, errorMessage]);
+      await addMessageAndSave(errorMessage);
     }
   };
 
@@ -507,27 +541,6 @@ const ChatInterface = ({ onNavigate }: ChatInterfaceProps) => {
     setViewMode('dashboard');
   };
 
-  const handleSessionClick = async (session: SessionHistory) => {
-    try {
-      const messages = await getSessionMessages(session.id);
-      const formattedMessages: Message[] = messages.map(msg => ({
-        id: msg.id,
-        type: msg.message_type === 'user' ? 'user' : 'ai',
-        content: msg.content,
-        timestamp: new Date(msg.created_at)
-      }));
-
-      setSessionMessages(formattedMessages);
-      setSelectedSession(session);
-    } catch (error) {
-      console.error('Failed to load session messages:', error);
-    }
-  };
-
-  const handleBackToHistory = () => {
-    setSelectedSession(null);
-    setSessionMessages([]);
-  };
 
   const handleLogout = async () => {
     await auth.signOut();
@@ -683,19 +696,6 @@ const ChatInterface = ({ onNavigate }: ChatInterfaceProps) => {
             </div>
 
             <div className="flex items-center space-x-4">
-              <button
-                onClick={() => {
-                  if (!showHistory && currentUser) {
-                    loadSessionHistory();
-                  }
-                  setShowHistory(!showHistory);
-                }}
-                className="flex items-center space-x-2 text-gray-300 hover:text-white transition-colors duration-200"
-              >
-                <History className="h-5 w-5" />
-                <span>History</span>
-              </button>
-
               {flowStage === 'documents' || flowStage === 'rating' ? (
                 <button
                   onClick={() => setViewMode('dashboard')}
@@ -719,90 +719,6 @@ const ChatInterface = ({ onNavigate }: ChatInterfaceProps) => {
 
       {/* Main Content Area */}
       <div className="flex-1 flex overflow-hidden">
-        {/* History Sidebar */}
-        {showHistory && (
-          <div className="w-80 border-r border-gray-800 bg-gray-900/50 flex flex-col">
-            {!selectedSession ? (
-              <>
-                <div className="p-4 border-b border-gray-800">
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-lg font-semibold">Session History</h3>
-                    <button
-                      onClick={() => setShowHistory(false)}
-                      className="text-gray-400 hover:text-white"
-                    >
-                      <X className="h-5 w-5" />
-                    </button>
-                  </div>
-                </div>
-                <div className="p-4 space-y-3 overflow-y-auto">
-                  {sessionHistory.length === 0 ? (
-                    <p className="text-gray-400 text-center py-8">No previous sessions</p>
-                  ) : (
-                    sessionHistory.map((session) => (
-                      <div
-                        key={session.id}
-                        onClick={() => handleSessionClick(session)}
-                        className="bg-gray-800 rounded-lg p-3 hover:bg-gray-700 transition-colors duration-200 cursor-pointer"
-                      >
-                        <div className="flex items-center space-x-3">
-                          <session.icon className="h-5 w-5 text-blue-500" />
-                          <div className="flex-1">
-                            <p className="font-medium text-sm">{session.service}</p>
-                            <p className="text-xs text-gray-500">
-                              {session.timestamp.toLocaleDateString()} at {session.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                            </p>
-                            {session.rating && (
-                              <div className="flex items-center space-x-1 mt-1">
-                                {Array.from({ length: 5 }).map((_, i) => (
-                                  <Star
-                                    key={i}
-                                    className={`h-3 w-3 ${i < session.rating! ? 'text-yellow-400 fill-yellow-400' : 'text-gray-600'}`}
-                                  />
-                                ))}
-                                <span className="text-xs text-gray-400 ml-1">({session.rating}/5)</span>
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </>
-            ) : (
-              <>
-                <div className="p-4 border-b border-gray-800">
-                  <div className="flex items-center justify-between mb-3">
-                    <button
-                      onClick={handleBackToHistory}
-                      className="text-blue-500 hover:text-blue-400 flex items-center space-x-1"
-                    >
-                      <span className="text-lg">←</span>
-                      <span>Back</span>
-                    </button>
-                    <button
-                      onClick={() => setShowHistory(false)}
-                      className="text-gray-400 hover:text-white"
-                    >
-                      <X className="h-5 w-5" />
-                    </button>
-                  </div>
-                </div>
-                <div className="flex-1 overflow-y-auto p-4 space-y-4">
-                  {sessionMessages.map((msg) => (
-                    <div key={msg.id} className={`flex ${msg.type === 'user' ? 'justify-end' : 'justify-start'}`}>
-                      <div className={`max-w-[85%] ${msg.type === 'user' ? 'bg-blue-600' : 'bg-gray-800'} rounded-lg p-3`}>
-                        <p className="text-sm whitespace-pre-wrap break-words">{msg.content}</p>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </>
-            )}
-          </div>
-        )}
-
         {/* Main Content */}
         <div className="flex-1 flex flex-col">
           {renderMainContent()}

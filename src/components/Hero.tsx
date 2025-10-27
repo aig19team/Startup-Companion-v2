@@ -25,17 +25,14 @@ const Hero = ({ onNavigate }: HeroProps) => {
           </div>
 
           {/* Main Header */}
-          <h2 className="text-2xl lg:text-4xl font-bold text-white mb-6 leading-tight max-w-5xl mx-auto">
-            Personalized guide to turn your idea into a legally established business in 
+          <h2 className="text-2xl lg:text-3xl font-bold text-white mb-6 leading-tight max-w-5xl mx-auto">
+            Personalized guidance for setting up your business in 
             <span className="text-blue-500"> less than 30 minutes</span>
           </h2>
 
           {/* Sub-headers */}
           <div className="space-y-4 mb-8">
-            <p className="text-xl lg:text-2xl text-gray-300 font-semibold">
-              Spark of idea to Successful business launch
-            </p>
-            <p className="text-lg lg:text-xl text-gray-400 max-w-4xl mx-auto leading-relaxed">
+            <p className="text-lg lg:text-xl text-white-400 max-w-4xl mx-auto leading-relaxed">
               Your one-stop shop — get expert guidance on legal requirements, registration, 
               financial options, branding and HR all tailored to your unique business idea.
             </p>

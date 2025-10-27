@@ -105,6 +105,34 @@ export async function getSessionMessages(sessionId: string) {
   }
 }
 
+export async function saveChatMessage(
+  sessionId: string,
+  userId: string,
+  messageType: 'user' | 'ai',
+  content: string
+): Promise<boolean> {
+  try {
+    const { error } = await supabase
+      .from('chat_messages')
+      .insert([{
+        session_id: sessionId,
+        user_id: userId,
+        message_type: messageType,
+        content: content
+      }]);
+
+    if (error) {
+      console.error('Error saving chat message:', error);
+      return false;
+    }
+
+    return true;
+  } catch (err) {
+    console.error('Unexpected error saving chat message:', err);
+    return false;
+  }
+}
+
 export function getServiceDisplayName(serviceType: string): string {
   const serviceNames: Record<string, string> = {
     'idea_tuning': 'Idea Tuning',
@@ -113,7 +141,8 @@ export function getServiceDisplayName(serviceType: string): string {
     'compliance': 'Compliance',
     'branding': 'Branding',
     'hr_setup': 'HR Setup',
-    'financial_planning': 'Financial Planning'
+    'financial_planning': 'Financial Planning',
+    'confirmed_idea_flow': 'Confirmed Idea Flow'
   };
 
   return serviceNames[serviceType] || serviceType;

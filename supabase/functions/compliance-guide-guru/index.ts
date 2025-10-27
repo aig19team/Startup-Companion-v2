@@ -1,4 +1,5 @@
 import { createClient } from 'npm:@supabase/supabase-js@2';
+import { generateAndStorePDF } from '../_shared/pdfGenerator.ts';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -102,7 +103,7 @@ Deno.serve(async (req: Request) => {
       const { data: profileData } = await supabaseClient
         .from('business_profiles')
         .select('*')
-        .eq('user_id', userId)
+        .eq('session_id', sessionId)
         .maybeSingle();
       profile = profileData || {};
     }
@@ -120,25 +121,78 @@ Generate a comprehensive compliance guide for this business covering all regulat
     const fullContent = await callOpenRouterAPI(contextInfo);
     const keyPoints = extractKeyPoints(fullContent);
 
-    const { data: docData } = await supabaseClient
+    // Generate and store PDF
+    const pdfResult = await generateAndStorePDF(
+      {
+        userId,
+        documentType: 'compliance',
+        content: fullContent,
+        businessName: profile.business_name || 'Your Business'
+      },
+      supabaseClient
+    );
+
+    // Use upsert to handle re-generation scenarios
+    // Check if document already exists for this session and type
+    const { data: existingDoc } = await supabaseClient
       .from('generated_documents')
-      .insert({
-        user_id: userId,
-        session_id: sessionId,
-        document_type: 'compliance',
-        document_title: 'Compliance Guide',
-        key_points: keyPoints,
-        full_content: fullContent,
-        generation_status: 'completed'
-      })
-      .select()
-      .single();
+      .select('id')
+      .eq('session_id', sessionId)
+      .eq('document_type', 'compliance')
+      .maybeSingle();
+
+    let docData, docError;
+
+    if (existingDoc) {
+      // Update existing document
+      const result = await supabaseClient
+        .from('generated_documents')
+        .update({
+          document_title: 'Compliance Guide',
+          key_points: JSON.stringify(keyPoints),
+          full_content: fullContent,
+          pdf_url: pdfResult?.pdfUrl || null,
+          pdf_file_name: pdfResult?.fileName || null,
+          generation_status: 'completed',
+          service_type: 'confirmed_idea_flow'
+        })
+        .eq('id', existingDoc.id)
+        .select()
+        .single();
+      docData = result.data;
+      docError = result.error;
+    } else {
+      // Insert new document
+      const result = await supabaseClient
+        .from('generated_documents')
+        .insert({
+          user_id: userId,
+          session_id: sessionId,
+          document_type: 'compliance',
+          document_title: 'Compliance Guide',
+          key_points: JSON.stringify(keyPoints),
+          full_content: fullContent,
+          pdf_url: pdfResult?.pdfUrl || null,
+          pdf_file_name: pdfResult?.fileName || null,
+          generation_status: 'completed',
+          service_type: 'confirmed_idea_flow'
+        })
+        .select()
+        .single();
+      docData = result.data;
+      docError = result.error;
+    }
+
+    if (docError) {
+      console.error('Error storing document in database:', docError);
+    }
 
     return new Response(
       JSON.stringify({
         response: fullContent,
         keyPoints: keyPoints,
         fullContent: fullContent,
+        pdfUrl: pdfResult?.pdfUrl,
         documentId: docData?.id
       }),
       {
@@ -231,13 +285,78 @@ async function callOpenRouterAPI(contextInfo: string): Promise<string> {
 
 function extractKeyPoints(content: string): string[] {
   const keyPoints: string[] = [];
-  
-  keyPoints.push('Complete tax compliance checklist (GST, TDS, Income Tax)');
-  keyPoints.push('ROC annual filing requirements and deadlines');
-  keyPoints.push('Labor law compliance (PF, ESI, Professional Tax)');
-  keyPoints.push('Industry-specific licenses and permits guide');
-  keyPoints.push('Monthly, quarterly, and annual compliance calendar');
-  keyPoints.push('Compliance costs and professional fees breakdown');
-  
-  return keyPoints;
+
+  if (!content || content.length < 100) {
+    return [
+      'Tax compliance checklist (GST, TDS, Income Tax)',
+      'ROC filing requirements and deadlines',
+      'Labor law compliance (PF, ESI)',
+      'Industry-specific licenses guide',
+      'Compliance calendar and deadlines',
+      'Cost breakdown and professional fees'
+    ];
+  }
+
+  // Check for tax compliance mentions
+  const taxKeywords = ['gst', 'tds', 'income tax', 'tax compliance'];
+  if (taxKeywords.some(keyword => content.toLowerCase().includes(keyword))) {
+    keyPoints.push('Complete tax compliance checklist (GST, TDS, Income Tax)');
+  }
+
+  // Check for ROC compliance
+  if (content.toLowerCase().includes('roc') || content.toLowerCase().includes('annual filing') ||
+      content.toLowerCase().includes('aoc-4') || content.toLowerCase().includes('mgt-7')) {
+    keyPoints.push('ROC annual filing requirements and deadlines');
+  }
+
+  // Check for labor law compliance
+  const laborKeywords = ['provident fund', 'pf', 'esi', 'professional tax', 'labor law', 'labour law'];
+  if (laborKeywords.some(keyword => content.toLowerCase().includes(keyword))) {
+    keyPoints.push('Labor law compliance (PF, ESI, Professional Tax)');
+  }
+
+  // Check for licenses
+  if (content.toLowerCase().includes('license') || content.toLowerCase().includes('permit')) {
+    keyPoints.push('Industry-specific licenses and permits guide');
+  }
+
+  // Check for compliance calendar
+  if (content.toLowerCase().includes('monthly') || content.toLowerCase().includes('quarterly') ||
+      content.toLowerCase().includes('calendar') || content.toLowerCase().includes('deadline')) {
+    keyPoints.push('Compliance calendar with key deadlines');
+  }
+
+  // Check for cost information
+  if (content.toLowerCase().includes('cost') || content.toLowerCase().includes('fee') ||
+      content.toLowerCase().includes('professional charges')) {
+    keyPoints.push('Compliance costs and professional fees breakdown');
+  }
+
+  // Check for data protection/privacy
+  if (content.toLowerCase().includes('data protection') || content.toLowerCase().includes('privacy') ||
+      content.toLowerCase().includes('dpdp')) {
+    keyPoints.push('Data protection and privacy compliance');
+  }
+
+  // Check for penalties
+  if (content.toLowerCase().includes('penalt') || content.toLowerCase().includes('late filing')) {
+    keyPoints.push('Penalties and consequences overview');
+  }
+
+  // Add fallback points if needed
+  const fallbackPoints = [
+    'Essential tax compliance requirements',
+    'Statutory filing obligations',
+    'Employee benefit regulations',
+    'Business license requirements',
+    'Ongoing compliance timeline',
+    'Regulatory cost estimates'
+  ];
+
+  for (const fallback of fallbackPoints) {
+    if (keyPoints.length >= 6) break;
+    keyPoints.push(fallback);
+  }
+
+  return keyPoints.slice(0, 6);
 }

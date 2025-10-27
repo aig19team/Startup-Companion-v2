@@ -85,7 +85,7 @@ const DocumentDashboard: React.FC<DocumentDashboardProps> = ({
                 {doc.status === 'generating' && (
                   <div className="flex items-center justify-center py-8">
                     <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500"></div>
-                    <span className="ml-3 text-gray-400">Generating...</span>
+                    <span className="ml-3 text-white-400">Generating...</span>
                   </div>
                 )}
 
@@ -99,10 +99,10 @@ const DocumentDashboard: React.FC<DocumentDashboardProps> = ({
                   <>
                     {/* Key Points */}
                     <div className="space-y-2 mb-4">
-                      <h4 className="text-sm font-semibold text-gray-300 mb-2">Key Highlights:</h4>
+                      <h4 className="text-sm font-semibold text-white-300 mb-2">Key Highlights:</h4>
                       <ul className="space-y-2">
                         {doc.keyPoints.slice(0, 5).map((point, index) => (
-                          <li key={index} className="flex items-start space-x-2 text-sm text-gray-400">
+                          <li key={index} className="flex items-start space-x-2 text-sm text-white-400">
                             <span className="text-blue-500 mt-1">•</span>
                             <span>{point}</span>
                           </li>

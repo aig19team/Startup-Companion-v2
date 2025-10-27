@@ -1,4 +1,5 @@
 import { createClient } from 'npm:@supabase/supabase-js@2';
+import { generateAndStorePDF } from '../_shared/pdfGenerator.ts';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -125,7 +126,7 @@ Deno.serve(async (req: Request) => {
       const { data: profileData } = await supabaseClient
         .from('business_profiles')
         .select('*')
-        .eq('user_id', userId)
+        .eq('session_id', sessionId)
         .maybeSingle();
       profile = profileData || {};
     }
@@ -142,25 +143,78 @@ Generate a comprehensive HR setup guide for this business covering policies, doc
     const fullContent = await callOpenRouterAPI(contextInfo);
     const keyPoints = extractKeyPoints(fullContent);
 
-    const { data: docData } = await supabaseClient
+    // Generate and store PDF
+    const pdfResult = await generateAndStorePDF(
+      {
+        userId,
+        documentType: 'hr',
+        content: fullContent,
+        businessName: profile.business_name || 'Your Business'
+      },
+      supabaseClient
+    );
+
+    // Use upsert to handle re-generation scenarios
+    // Check if document already exists for this session and type
+    const { data: existingDoc } = await supabaseClient
       .from('generated_documents')
-      .insert({
-        user_id: userId,
-        session_id: sessionId,
-        document_type: 'hr',
-        document_title: 'HR Setup Guide',
-        key_points: keyPoints,
-        full_content: fullContent,
-        generation_status: 'completed'
-      })
-      .select()
-      .single();
+      .select('id')
+      .eq('session_id', sessionId)
+      .eq('document_type', 'hr')
+      .maybeSingle();
+
+    let docData, docError;
+
+    if (existingDoc) {
+      // Update existing document
+      const result = await supabaseClient
+        .from('generated_documents')
+        .update({
+          document_title: 'HR Setup Guide',
+          key_points: JSON.stringify(keyPoints),
+          full_content: fullContent,
+          pdf_url: pdfResult?.pdfUrl || null,
+          pdf_file_name: pdfResult?.fileName || null,
+          generation_status: 'completed',
+          service_type: 'confirmed_idea_flow'
+        })
+        .eq('id', existingDoc.id)
+        .select()
+        .single();
+      docData = result.data;
+      docError = result.error;
+    } else {
+      // Insert new document
+      const result = await supabaseClient
+        .from('generated_documents')
+        .insert({
+          user_id: userId,
+          session_id: sessionId,
+          document_type: 'hr',
+          document_title: 'HR Setup Guide',
+          key_points: JSON.stringify(keyPoints),
+          full_content: fullContent,
+          pdf_url: pdfResult?.pdfUrl || null,
+          pdf_file_name: pdfResult?.fileName || null,
+          generation_status: 'completed',
+          service_type: 'confirmed_idea_flow'
+        })
+        .select()
+        .single();
+      docData = result.data;
+      docError = result.error;
+    }
+
+    if (docError) {
+      console.error('Error storing document in database:', docError);
+    }
 
     return new Response(
       JSON.stringify({
         response: fullContent,
         keyPoints: keyPoints,
         fullContent: fullContent,
+        pdfUrl: pdfResult?.pdfUrl,
         documentId: docData?.id
       }),
       {
@@ -253,13 +307,94 @@ async function callOpenRouterAPI(contextInfo: string): Promise<string> {
 
 function extractKeyPoints(content: string): string[] {
   const keyPoints: string[] = [];
-  
-  keyPoints.push('Complete employment documentation templates');
-  keyPoints.push('Essential HR policies (leave, attendance, code of conduct)');
-  keyPoints.push('Salary structure and compensation guidelines');
-  keyPoints.push('Payroll processing and statutory compliance');
-  keyPoints.push('Onboarding and performance management frameworks');
-  keyPoints.push('HR technology and tools recommendations');
-  
-  return keyPoints;
+
+  if (!content || content.length < 100) {
+    return [
+      'Employment documentation templates',
+      'HR policies (leave, attendance, conduct)',
+      'Salary structure guidelines',
+      'Payroll and statutory compliance',
+      'Onboarding and performance management',
+      'HR technology recommendations'
+    ];
+  }
+
+  // Check for employment documentation
+  const docKeywords = ['offer letter', 'appointment letter', 'employment agreement', 'nda', 'documentation'];
+  if (docKeywords.some(keyword => content.toLowerCase().includes(keyword))) {
+    keyPoints.push('Complete employment documentation templates');
+  }
+
+  // Check for HR policies
+  const policyKeywords = ['leave policy', 'attendance', 'code of conduct', 'hr polic', 'work hours'];
+  if (policyKeywords.some(keyword => content.toLowerCase().includes(keyword))) {
+    keyPoints.push('Essential HR policies (leave, attendance, conduct)');
+  }
+
+  // Check for compensation
+  const compensationKeywords = ['salary', 'compensation', 'pay structure', 'wages', 'benefits'];
+  if (compensationKeywords.some(keyword => content.toLowerCase().includes(keyword))) {
+    keyPoints.push('Salary structure and compensation guidelines');
+  }
+
+  // Check for payroll
+  const payrollKeywords = ['payroll', 'pf', 'provident fund', 'tds', 'payslip', 'statutory'];
+  if (payrollKeywords.some(keyword => content.toLowerCase().includes(keyword))) {
+    keyPoints.push('Payroll processing and statutory compliance');
+  }
+
+  // Check for onboarding
+  if (content.toLowerCase().includes('onboarding') || content.toLowerCase().includes('orientation') ||
+      content.toLowerCase().includes('joining process')) {
+    keyPoints.push('Structured onboarding process');
+  }
+
+  // Check for performance management
+  const performanceKeywords = ['performance', 'appraisal', 'review', 'kpi', 'okr', 'goal setting'];
+  if (performanceKeywords.some(keyword => content.toLowerCase().includes(keyword))) {
+    keyPoints.push('Performance management framework');
+  }
+
+  // Check for organizational structure
+  if (content.toLowerCase().includes('org') && (content.toLowerCase().includes('chart') ||
+      content.toLowerCase().includes('structure') || content.toLowerCase().includes('hierarchy'))) {
+    keyPoints.push('Organizational structure recommendations');
+  }
+
+  // Check for HR technology
+  if (content.toLowerCase().includes('hrms') || content.toLowerCase().includes('software') ||
+      content.toLowerCase().includes('tool') || content.toLowerCase().includes('technology')) {
+    keyPoints.push('HR technology and tools recommendations');
+  }
+
+  // Check for compliance
+  const complianceKeywords = ['minimum wages', 'gratuity', 'maternity', 'posh', 'compliance', 'labor law'];
+  if (complianceKeywords.some(keyword => content.toLowerCase().includes(keyword))) {
+    keyPoints.push('Legal compliance requirements');
+  }
+
+  // Check for employee engagement
+  if (content.toLowerCase().includes('engagement') || content.toLowerCase().includes('team building') ||
+      content.toLowerCase().includes('recognition')) {
+    keyPoints.push('Employee engagement strategies');
+  }
+
+  // Add fallback points if needed
+  const fallbackPoints = [
+    'Employment contract templates',
+    'Core HR policy framework',
+    'Compensation and benefits structure',
+    'Statutory compliance guide',
+    'Employee lifecycle management',
+    'HR systems and processes'
+  ];
+
+  for (const fallback of fallbackPoints) {
+    if (keyPoints.length >= 6) break;
+    if (!keyPoints.some(point => point.toLowerCase().includes(fallback.toLowerCase().split(' ')[0]))) {
+      keyPoints.push(fallback);
+    }
+  }
+
+  return keyPoints.slice(0, 6);
 }

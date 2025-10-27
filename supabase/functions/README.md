@@ -16,7 +16,7 @@ This API key is required for all document generation functions (registration, br
 
 2. Update the `.env` file with your OpenRouter API key:
    ```
-   OPENROUTER_API_KEY=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
+   OPENROUTER_API_KEY=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
    ```
 
 3. The `.env` file is gitignored, so your API key will not be committed to version control
